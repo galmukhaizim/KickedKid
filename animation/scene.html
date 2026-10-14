@@ -1,0 +1,749 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;background:#000;overflow:hidden;font-family:Inter,'DejaVu Sans',sans-serif}
+  #stage{position:relative;width:1280px;height:720px;overflow:hidden}
+  canvas{display:block}
+  #ui{position:absolute;inset:0;pointer-events:none}
+  #chyron{position:absolute;left:36px;top:30px;padding:6px 14px;background:rgba(0,0,0,.55);color:#fff;font-size:20px;letter-spacing:3px;font-weight:600;border-left:4px solid #ffb400;opacity:0}
+  #cap{position:absolute;left:50%;bottom:44px;transform:translateX(-50%);max-width:1000px;padding:12px 24px;background:rgba(0,0,0,.62);color:#fff;font-size:30px;line-height:1.25;text-align:center;border-radius:6px;opacity:0}
+  #who{font-weight:800;letter-spacing:1px;margin-right:12px}
+  #title{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;text-align:center;opacity:0}
+  #title .big{font-size:64px;font-weight:900;letter-spacing:4px;text-shadow:0 4px 30px rgba(0,0,0,.8)}
+  #title .small{font-size:26px;margin-top:18px;letter-spacing:2px;opacity:.9}
+  #flash{position:absolute;inset:0;background:#fff;opacity:0}
+  #fade{position:absolute;inset:0;background:#000;opacity:0}
+</style>
+</head>
+<body>
+<div id="stage">
+<canvas id="c" width="1280" height="720"></canvas>
+<div id="ui">
+  <div id="chyron"></div>
+  <div id="cap"><span id="who"></span><span id="txt"></span></div>
+  <div id="title"><div class="big"></div><div class="small"></div></div>
+  <div id="flash"></div>
+  <div id="fade"></div>
+</div>
+</div>
+<script type="module">
+import * as THREE from './node_modules/three/build/three.module.js';
+
+// ---------- setup ----------
+const q = new URLSearchParams(location.search);
+const W = +q.get('w') || 1280, H = +q.get('h') || 720;
+const stage = document.getElementById('stage');
+stage.style.width = W + 'px'; stage.style.height = H + 'px';
+const uiScale = W / 1280;
+document.getElementById('ui').style.transform = `scale(${uiScale})`;
+document.getElementById('ui').style.transformOrigin = '0 0';
+document.getElementById('ui').style.width = '1280px';
+document.getElementById('ui').style.height = '720px';
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H, false);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, W / H, 0.05, 3000);
+
+// ---------- helpers ----------
+const M = (c, o = {}) => new THREE.MeshLambertMaterial(Object.assign({ color: c }, o));
+const E = (c, e, i = 1) => new THREE.MeshLambertMaterial({ color: c, emissive: e, emissiveIntensity: i });
+function mesh(geo, mat, x = 0, y = 0, z = 0) { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true; return m; }
+function box(w, h, d, mat, x, y, z) { return mesh(new THREE.BoxGeometry(w, h, d), mat, x, y, z); }
+function cyl(rt, rb, h, mat, x, y, z, seg = 16) { return mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat, x, y, z); }
+function sph(r, mat, x, y, z, seg = 16) { return mesh(new THREE.SphereGeometry(r, seg, Math.max(6, seg >> 1)), mat, x, y, z); }
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ss = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+function kf(t, keys, ease = ss) {
+  if (t <= keys[0][0]) return keys[0][1];
+  for (let i = 1; i < keys.length; i++) {
+    if (t <= keys[i][0]) { const [t0, v0] = keys[i - 1], [t1, v1] = keys[i]; return lerp(v0, v1, ease((t - t0) / (t1 - t0))); }
+  }
+  return keys[keys.length - 1][1];
+}
+function kf3(t, keys, ease = ss) {
+  const x = kf(t, keys.map(k => [k[0], k[1][0]]), ease), y = kf(t, keys.map(k => [k[0], k[1][1]]), ease), z = kf(t, keys.map(k => [k[0], k[1][2]]), ease);
+  return new THREE.Vector3(x, y, z);
+}
+const lin = t => clamp(t, 0, 1);
+function pulse(t, t0, up, down) { if (t < t0) return 0; if (t < t0 + up) return (t - t0) / up; if (t < t0 + up + down) return 1 - (t - t0 - up) / down; return 0; }
+function seeded(n) { let s = n * 9301 + 49297; return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; }; }
+function camSet(pos, look, fov = 45) { camera.position.copy(pos); camera.lookAt(look); camera.fov = fov; camera.updateProjectionMatrix(); }
+function shake(t, amp) { return new THREE.Vector3(Math.sin(t * 37.1) * amp + Math.sin(t * 61.3) * amp * .5, Math.cos(t * 43.7) * amp, Math.sin(t * 29.3) * amp * .3); }
+function canvasTex(w, h, draw, repeat) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); draw(g, w, h);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat[0], repeat[1]); }
+  return t;
+}
+function skyDome(top, mid, bottom) {
+  const tex = canvasTex(4, 256, (g, w, h) => { const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, top); gr.addColorStop(0.55, mid); gr.addColorStop(1, bottom); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
+  const m = new THREE.Mesh(new THREE.SphereGeometry(1400, 24, 16), new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, fog: false }));
+  return m;
+}
+function stars(n, r) {
+  const rnd = seeded(7); const pos = [];
+  for (let i = 0; i < n; i++) { const th = rnd() * Math.PI * 2, ph = Math.acos(rnd() * 0.9); pos.push(r * Math.sin(ph) * Math.cos(th), r * Math.cos(ph), r * Math.sin(ph) * Math.sin(th)); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  return new THREE.Points(g, new THREE.PointsMaterial({ color: 0xffffff, size: 2.2, sizeAttenuation: false, fog: false }));
+}
+
+// ---------- characters ----------
+function makePerson(o) {
+  o = Object.assign({ skin: 0xf1c27d, top: 0x3355aa, sleeve: null, bottom: 0x222233, hair: 0x222222, hairStyle: 'short', shoes: 0x111111, pregnant: false, scale: 0.92, brow: 'flat', browColor: null, tie: null, cap: null, glasses: false, mustache: null, bignose: false, suspenders: null, longSleeve: false, lips: 0x7a3b3b, badge: false }, o);
+  const skin = M(o.skin), top = M(o.top), sleeve = M(o.sleeve ?? o.top), bottom = M(o.bottom), hair = M(o.hair), shoes = M(o.shoes);
+  const root = new THREE.Group(); root.scale.setScalar(o.scale);
+  const P = { root, base: {} };
+  root.add(box(0.34, 0.2, 0.22, bottom, 0, -0.02, 0));
+  const torso = new THREE.Group(); root.add(torso); P.torso = torso;
+  torso.add(mesh(new THREE.CapsuleGeometry(0.17, 0.32, 4, 12), top, 0, 0.32, 0));
+  if (o.pregnant) torso.add(sph(0.2, top, 0, 0.17, 0.1));
+  if (o.tie) torso.add(box(0.05, 0.3, 0.02, M(o.tie), 0, 0.33, 0.175));
+  if (o.suspenders) for (const s of [-1, 1]) torso.add(box(0.035, 0.46, 0.015, M(o.suspenders), s * 0.08, 0.3, 0.175));
+  if (o.badge) torso.add(box(0.06, 0.06, 0.01, E(0xffd700, 0xffd700, 0.6), 0.1, 0.42, 0.18));
+  torso.add(cyl(0.05, 0.05, 0.1, skin, 0, 0.6, 0, 8));
+  const head = new THREE.Group(); head.position.y = 0.64; torso.add(head); P.head = head;
+  const hc = 0.15;
+  head.add(sph(0.15, skin, 0, hc, 0, 20));
+  for (const s of [-1, 1]) { head.add(sph(0.034, M(0xffffff), s * 0.055, hc + 0.02, 0.125, 10)); head.add(sph(0.015, M(0x111111), s * 0.055, hc + 0.02, 0.155, 8)); }
+  const bc = M(o.browColor ?? o.hair);
+  for (const s of [-1, 1]) { const b = box(0.07, 0.018, 0.02, bc, s * 0.055, hc + 0.075, 0.14); if (o.brow === 'angry') b.rotation.z = s * 0.45; if (o.brow === 'bushy') { b.scale.set(1.3, 2.2, 1.8); b.rotation.z = s * 0.25; } head.add(b); }
+  const mouth = box(0.06, 0.012, 0.015, M(o.lips), 0, hc - 0.07, 0.14); head.add(mouth); P.mouth = mouth;
+  if (o.bignose) { const n = mesh(new THREE.ConeGeometry(0.03, 0.09, 8), skin, 0, hc - 0.01, 0.17); n.rotation.x = Math.PI / 2; head.add(n); }
+  else head.add(sph(0.025, skin, 0, hc - 0.01, 0.15, 8));
+  if (o.hairStyle === 'short') head.add(mesh(new THREE.SphereGeometry(0.16, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.5), hair, 0, hc + 0.01, 0));
+  if (o.hairStyle === 'slick') { const h = mesh(new THREE.SphereGeometry(0.16, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.5), hair, 0, hc + 0.01, -0.01); h.scale.set(1, 0.9, 1.05); head.add(h); }
+  if (o.hairStyle === 'long') { head.add(mesh(new THREE.SphereGeometry(0.165, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.55), hair, 0, hc + 0.01, 0)); head.add(cyl(0.15, 0.12, 0.38, hair, 0, hc - 0.12, -0.07, 12)); }
+  if (o.hairStyle === 'bun') { head.add(mesh(new THREE.SphereGeometry(0.16, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.5), hair, 0, hc + 0.01, 0)); head.add(sph(0.07, hair, 0, hc + 0.08, -0.14)); }
+  if (o.hairStyle === 'tufts') { for (const s of [-1, 1]) { const t = sph(0.065, hair, s * 0.13, hc - 0.01, -0.03); t.scale.set(0.7, 1, 1.2); head.add(t); } head.add(sph(0.05, hair, 0, hc, -0.145)); }
+  if (o.cap) { const capm = M(o.cap); head.add(cyl(0.175, 0.165, 0.07, capm, 0, hc + 0.12, -0.01)); const brim = box(0.2, 0.02, 0.12, capm, 0, hc + 0.09, 0.19); brim.rotation.x = 0.15; head.add(brim); }
+  if (o.glasses) { const gm = M(0x1a1a1a); for (const s of [-1, 1]) head.add(mesh(new THREE.TorusGeometry(0.05, 0.009, 6, 18), gm, s * 0.058, hc + 0.02, 0.15)); head.add(box(0.03, 0.009, 0.009, gm, 0, hc + 0.025, 0.155)); for (const s of [-1, 1]) head.add(box(0.012, 0.009, 0.14, gm, s * 0.14, hc + 0.025, 0.08)); }
+  if (o.mustache) head.add(box(0.1, 0.03, 0.035, M(o.mustache), 0, hc - 0.045, 0.15));
+  P.arm = {};
+  for (const s of [-1, 1]) {
+    const sh = new THREE.Group(); sh.position.set(s * 0.25, 0.55, 0); torso.add(sh);
+    sh.add(sph(0.065, sleeve, 0, 0, 0, 10));
+    sh.add(cyl(0.06, 0.05, 0.3, sleeve, 0, -0.15, 0, 10));
+    const el = new THREE.Group(); el.position.y = -0.3; sh.add(el);
+    el.add(cyl(0.05, 0.04, 0.28, o.longSleeve ? sleeve : skin, 0, -0.14, 0, 10));
+    const hand = sph(0.055, skin, 0, -0.3, 0, 10); el.add(hand);
+    P.arm[s < 0 ? 'L' : 'R'] = { sh, el, hand };
+  }
+  P.leg = {};
+  for (const s of [-1, 1]) {
+    const hip = new THREE.Group(); hip.position.set(s * 0.1, -0.05, 0); root.add(hip);
+    hip.add(cyl(0.085, 0.07, 0.45, bottom, 0, -0.225, 0, 10));
+    const kn = new THREE.Group(); kn.position.y = -0.45; hip.add(kn);
+    kn.add(cyl(0.065, 0.055, 0.45, bottom, 0, -0.225, 0, 10));
+    kn.add(box(0.11, 0.07, 0.24, shoes, 0, -0.465, 0.05));
+    P.leg[s < 0 ? 'L' : 'R'] = { hip, kn };
+  }
+  P.standY = 1.0 * o.scale;
+  P.pose = (p) => {
+    const q = Object.assign({}, P.base, p); const d = k => q[k] || 0;
+    torso.rotation.set(d('tx'), d('ty'), d('tz')); head.rotation.set(d('hx'), d('hy'), d('hz'));
+    P.arm.L.sh.rotation.set(d('lsx'), d('lsy'), d('lsz')); P.arm.L.el.rotation.set(d('lex'), 0, 0);
+    P.arm.R.sh.rotation.set(d('rsx'), d('rsy'), d('rsz')); P.arm.R.el.rotation.set(d('rex'), 0, 0);
+    P.leg.L.hip.rotation.set(d('lhx'), 0, d('lhz')); P.leg.L.kn.rotation.set(d('lkx'), 0, 0);
+    P.leg.R.hip.rotation.set(d('rhx'), 0, d('rhz')); P.leg.R.kn.rotation.set(d('rkx'), 0, 0);
+    mouth.scale.set(1, 1 + 4 * d('talk'), 1);
+  };
+  P.walkPose = (phase, amp, extra = {}) => {
+    const s = Math.sin(phase);
+    return Object.assign({ lhx: -amp * s, rhx: amp * s, lkx: amp * 1.2 * Math.max(0, s), rkx: amp * 1.2 * Math.max(0, -s), lsx: amp * 0.7 * s, rsx: -amp * 0.7 * s, lex: -0.3, rex: -0.3 }, extra);
+  };
+  P.place = (x, y, z, ry) => { root.position.set(x, y, z); root.rotation.set(0, ry, 0); };
+  return P;
+}
+const SIT = { lhx: -1.5, rhx: -1.5, lkx: 1.5, rkx: 1.5, lsx: -0.4, rsx: -0.4, lex: -0.9, rex: -0.9 };
+const STAND = { lex: -0.2, rex: -0.2 };
+const talk = (t, on) => on ? 0.5 + 0.5 * Math.sin(t * 22) : 0;
+
+// cast
+const tommy = makePerson({ skin: 0xe8b894, top: 0x15152a, sleeve: 0x15152a, bottom: 0x15152a, hair: 0x120d0a, hairStyle: 'slick', brow: 'angry', tie: 0xaa1122, longSleeve: true, shoes: 0x0a0a0a, scale: 0.96 });
+const woman = makePerson({ skin: 0xf3cba5, top: 0xf2a7c3, sleeve: 0xf2a7c3, bottom: 0x3a2e4a, hair: 0x4a2b16, hairStyle: 'long', pregnant: true, shoes: 0x7a5a3a, lips: 0xc0506a, scale: 0.86 });
+const mother = makePerson({ skin: 0xe9c3a0, top: 0x0b0b10, sleeve: 0x0b0b10, bottom: 0x0b0b10, hair: 0x2a1a10, hairStyle: 'bun', brow: 'angry', longSleeve: true, lips: 0xb01030, shoes: 0x111111, scale: 0.9 });
+const oldman = makePerson({ skin: 0xe6b89c, top: 0x8a5a2b, sleeve: 0x8a5a2b, bottom: 0x6d6d75, hair: 0xf0f0f0, hairStyle: 'tufts', brow: 'bushy', browColor: 0xf5f5f5, cap: 0x4a3a2a, glasses: true, mustache: 0xeeeeee, bignose: true, suspenders: 0x3a2a1a, longSleeve: true, shoes: 0x3a2a1a, scale: 0.84 });
+oldman.base = { tx: -0.42, hx: 0.5, lkx: 0.35, rkx: 0.35, lhx: -0.2, rhx: -0.2, lhz: 0.12, rhz: -0.12, lsx: -0.3, rsx: -0.6, rex: -0.9, lex: -0.6 };
+const pilot = makePerson({ skin: 0xd9a57a, top: 0xf4f4f4, sleeve: 0xf4f4f4, bottom: 0x1a1a2a, hair: 0x333333, cap: 0x101020, scale: 0.92 });
+const copilot = makePerson({ skin: 0xf1c27d, top: 0xf4f4f4, sleeve: 0xf4f4f4, bottom: 0x1a1a2a, hair: 0x6a4a2a, cap: 0x101020, scale: 0.9 });
+const guard1 = makePerson({ skin: 0x8d5a3b, top: 0x1b2a4a, sleeve: 0x1b2a4a, bottom: 0x1b2a4a, hair: 0x111111, cap: 0x1b2a4a, badge: true, longSleeve: true, scale: 0.98 });
+const guard2 = makePerson({ skin: 0xf1c27d, top: 0x1b2a4a, sleeve: 0x1b2a4a, bottom: 0x1b2a4a, hair: 0x3a2a1a, cap: 0x1b2a4a, badge: true, longSleeve: true, scale: 0.96 });
+const medic = makePerson({ skin: 0xc68642, top: 0x2d6cdf, sleeve: 0x2d6cdf, bottom: 0x1a1a3a, hair: 0x222222, hairStyle: 'short', scale: 0.9 });
+const passengers = [];
+{ const rnd = seeded(3); const cols = [0x556b2f, 0x8b0000, 0x2f4f4f, 0x6a5acd, 0xcd853f, 0x4682b4, 0x708090, 0xdaa520];
+  for (let i = 0; i < 8; i++) passengers.push(makePerson({ skin: [0xf1c27d, 0x8d5a3b, 0xe0ac69, 0xc68642][i % 4], top: cols[i], bottom: 0x222233, hair: [0x111111, 0x5a3a1a, 0xaaaaaa, 0x2a1a10][i % 4], hairStyle: i % 3 === 1 ? 'long' : 'short', scale: 0.85 + rnd() * 0.1 })); }
+// cane for old man (world-space object)
+const cane = new THREE.Group();
+{ const cm = M(0x5a3a1a); cane.add(cyl(0.018, 0.022, 0.9, cm, 0, -0.45, 0, 8)); const h = cyl(0.02, 0.02, 0.16, cm, 0.05, 0, 0, 8); h.rotation.z = Math.PI / 2; cane.add(h); cane.add(cyl(0.028, 0.028, 0.03, M(0x111111), 0, -0.9, 0, 8)); }
+const _hp = new THREE.Vector3(), _down = new THREE.Vector3(0, -1, 0);
+function placeCane(tipGround) {
+  oldman.arm.R.hand.getWorldPosition(_hp); cane.position.copy(_hp);
+  const dir = tipGround.clone().sub(_hp); const len = dir.length(); dir.normalize();
+  cane.quaternion.setFromUnitVectors(_down, dir); cane.scale.set(1, len / 0.9, 1);
+}
+
+// ---------- plane model ----------
+function makePlane() {
+  const g = new THREE.Group();
+  const white = M(0xf4f4f8), dark = M(0x1b1f2a), accent = M(0xc8102e), gold = M(0xd4af37);
+  const fus = cyl(1, 1, 12, white, 0, 0, 0, 24); fus.rotation.x = Math.PI / 2; g.add(fus);
+  const nose = sph(1, white, 0, 0, -6, 24); nose.scale.set(1, 1, 2.2); g.add(nose);
+  const tail = cyl(1, 0.3, 5, white, 0, 0.15, 8.5, 24); tail.rotation.x = Math.PI / 2; tail.rotation.z = 0; g.add(tail);
+  const fin = box(0.18, 3.6, 2.6, accent, 0, 2.2, 9.4); fin.rotation.x = -0.5; g.add(fin);
+  for (const s of [-1, 1]) { const st = box(3.2, 0.1, 1.2, white, s * 1.6, 0.4, 9.8); st.rotation.y = s * 0.35; g.add(st); }
+  for (const s of [-1, 1]) { const w = box(7.5, 0.16, 2.6, white, s * 4.2, -0.35, 1.2); w.rotation.y = -s * 0.4; w.rotation.z = s * 0.06; g.add(w);
+    const e = cyl(0.55, 0.5, 2.2, dark, s * 3.3, -1.05, 1.0, 16); e.rotation.x = Math.PI / 2; g.add(e);
+    const ei = cyl(0.5, 0.45, 0.4, gold, s * 3.3, -1.05, -0.1, 16); ei.rotation.x = Math.PI / 2; g.add(ei);
+    g.add(sph(0.08, E(s < 0 ? 0xff0000 : 0x00ff00, s < 0 ? 0xff0000 : 0x00ff00, 2), s * 7.6, -0.35, 2.7, 6));
+  }
+  for (let i = 0; i < 18; i++) for (const s of [-1, 1]) g.add(box(0.05, 0.3, 0.26, dark, s * 1.0, 0.3, -4.4 + i * 0.6));
+  const ck = box(2.2, 0.5, 0.9, dark, 0, 0.5, -6.6); ck.rotation.x = 0.4; g.add(ck);
+  g.add(box(0.05, 0.3, 9, accent, 1.0, -0.2, 1)); g.add(box(0.05, 0.3, 9, accent, -1.0, -0.2, 1));
+  const logo = mesh(new THREE.PlaneGeometry(2.4, 0.6), new THREE.MeshBasicMaterial({ map: canvasTex(256, 64, (c, w, h) => { c.fillStyle = '#0000'; c.clearRect(0, 0, w, h); c.font = 'bold 48px Inter, sans-serif'; c.fillStyle = '#d4af37'; c.textAlign = 'center'; c.fillText('HALE AIR', w / 2, 48); }), transparent: true }), 1.02, 0.15, 6.5); logo.rotation.y = Math.PI / 2; g.add(logo);
+  const logo2 = logo.clone(); logo2.position.x = -1.02; logo2.rotation.y = -Math.PI / 2; g.add(logo2);
+  const gear = new THREE.Group(); g.add(gear); g.gear = gear;
+  const tire = M(0x111111);
+  for (const [x, z] of [[0, -4.8], [-1.6, 1.4], [1.6, 1.4]]) { gear.add(cyl(0.06, 0.06, 1.4, dark, x, -1.4, z, 8)); const t = cyl(0.3, 0.3, 0.3, tire, x, -2.0, z, 12); t.rotation.z = Math.PI / 2; gear.add(t); }
+  const strobe = sph(0.1, E(0xffffff, 0xffffff, 3), 0, -1.05, 1.5, 6); g.add(strobe); g.strobe = strobe;
+  return g;
+}
+
+// ---------- cloud ----------
+function makeCloud(rnd, scale) {
+  const g = new THREE.Group(); const m = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const n = 4 + Math.floor(rnd() * 4);
+  for (let i = 0; i < n; i++) { const s = sph(scale * (0.5 + rnd() * 0.6), m, (rnd() - 0.5) * scale * 2.4, (rnd() - 0.5) * scale * 0.5, (rnd() - 0.5) * scale * 1.4, 10); s.castShadow = false; s.receiveShadow = false; g.add(s); }
+  return g;
+}
+
+// ---------- SETS ----------
+const sets = {};
+function newSet(name) { const g = new THREE.Group(); g.visible = false; scene.add(g); sets[name] = g; return g; }
+
+// EXT (cruise + title)
+const ext = newSet('ext');
+const duskSky = skyDome('#1a2a6e', '#ff8c4a', '#ffd9a0'); ext.add(duskSky);
+const extSun = new THREE.DirectionalLight(0xffd0a0, 2.2); extSun.position.set(-60, 30, -40); ext.add(extSun);
+ext.add(new THREE.HemisphereLight(0x8fb6ff, 0xffb080, 0.9));
+const plane1 = makePlane(); plane1.gear.visible = false; ext.add(plane1);
+const clouds1 = new THREE.Group(); ext.add(clouds1);
+{ const rnd = seeded(11); for (let i = 0; i < 70; i++) { const c = makeCloud(rnd, 3 + rnd() * 5); c.position.set((rnd() - 0.5) * 260, -8 - rnd() * 14, (rnd() - 0.5) * 260); clouds1.add(c); } }
+const cloudDeck = mesh(new THREE.PlaneGeometry(2000, 2000), new THREE.MeshLambertMaterial({ color: 0xffe6d0 }), 0, -24, 0); cloudDeck.rotation.x = -Math.PI / 2; cloudDeck.receiveShadow = false; ext.add(cloudDeck);
+
+// NIGHT EXT (descent)
+const night = newSet('night');
+night.add(skyDome('#02030c', '#0a1030', '#2a1a40'));
+night.add(stars(900, 1300));
+night.add(new THREE.HemisphereLight(0x3a4a8a, 0x101018, 0.7));
+const moon = new THREE.DirectionalLight(0xaac4ff, 1.1); moon.position.set(50, 80, -30); night.add(moon);
+const plane2 = makePlane(); plane2.gear.visible = false; night.add(plane2);
+{ const ground = mesh(new THREE.PlaneGeometry(4000, 4000), new THREE.MeshLambertMaterial({ color: 0x050710 }), 0, -70, 0); ground.rotation.x = -Math.PI / 2; night.add(ground);
+  const rnd = seeded(5); const pos = [], col = [];
+  for (let i = 0; i < 26000; i++) { const x = rnd() * 1400 - 200, z = (rnd() - 0.5) * 1800; if (x < 0 && rnd() > 0.1) continue; const grid = rnd() < 0.3; pos.push(grid ? Math.round(x / 6) * 6 : x, -69.5, grid ? Math.round(z / 6) * 6 : z);
+    const warm = rnd(); col.push(1, 0.6 + warm * 0.4, 0.3 + warm * 0.5); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  night.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 1.6, vertexColors: true, sizeAttenuation: true })));
+  const cn = new THREE.Group(); night.add(cn); for (let i = 0; i < 30; i++) { const c = makeCloud(rnd, 6 + rnd() * 8); c.position.set((rnd() - 0.5) * 400, -30 - rnd() * 20, (rnd() - 0.5) * 400); c.children.forEach(ch => ch.material = new THREE.MeshLambertMaterial({ color: 0x404860 })); cn.add(c); }
+}
+
+// LANDING set (runway)
+const land = newSet('land');
+land.add(skyDome('#02030c', '#0b1236', '#3a2050'));
+land.add(stars(700, 1300));
+land.add(new THREE.HemisphereLight(0x4050a0, 0x202020, 0.8));
+const landMoon = new THREE.DirectionalLight(0x9fb8ff, 0.9); landMoon.position.set(-100, 120, 60); land.add(landMoon);
+const plane3 = makePlane(); land.add(plane3);
+function buildAirport(g, withRunway) {
+  const asphalt = canvasTex(512, 512, (c, w, h) => { c.fillStyle = '#2a2a2e'; c.fillRect(0, 0, w, h); const r = seeded(2); for (let i = 0; i < 4000; i++) { c.fillStyle = r() < .5 ? '#25252a' : '#303035'; c.fillRect(r() * w, r() * h, 2, 2); } }, [60, 60]);
+  const ground = mesh(new THREE.PlaneGeometry(3000, 3000), new THREE.MeshLambertMaterial({ map: asphalt, color: 0x777777 }), 0, 0, 0); ground.rotation.x = -Math.PI / 2; ground.castShadow = false; g.add(ground);
+  if (withRunway) {
+    const rw = canvasTex(256, 2048, (c, w, h) => { c.fillStyle = '#3a3a3e'; c.fillRect(0, 0, w, h); c.fillStyle = '#e8e8e8'; for (let y = 0; y < h; y += 128) c.fillRect(w / 2 - 4, y, 8, 64); c.fillRect(6, 0, 6, h); c.fillRect(w - 12, 0, 6, h); }, [1, 12]);
+    const r = mesh(new THREE.PlaneGeometry(60, 1800), new THREE.MeshLambertMaterial({ map: rw }), 0, 0.02, 0); r.rotation.x = -Math.PI / 2; r.castShadow = false; g.add(r);
+    const pos = [], col = [];
+    for (let z = -900; z <= 900; z += 25) { for (const s of [-1, 1]) { pos.push(s * 31, 0.3, z); col.push(1, 1, 1); } pos.push(0, 0.3, z); col.push(1, 1, 1); }
+    for (let i = 0; i < 20; i++) for (let x = -14; x <= 14; x += 2.5) { pos.push(x, 0.3 + (i * 0.1), -920 - i * 30); col.push(1, 1, 1); }
+    for (let z = -900; z <= 900; z += 25) for (const s of [-1, 1]) { pos.push(s * 110, 0.3, z); col.push(0.2, 0.5, 1); }
+    const pg = new THREE.BufferGeometry(); pg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); pg.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    g.add(new THREE.Points(pg, new THREE.PointsMaterial({ size: 2.2, vertexColors: true, sizeAttenuation: true })));
+  }
+  // terminal
+  const winTex = canvasTex(1024, 128, (c, w, h) => { c.fillStyle = '#1a1c24'; c.fillRect(0, 0, w, h); const r = seeded(9); for (let x = 8; x < w; x += 24) for (let y = 12; y < h; y += 32) { c.fillStyle = r() < 0.75 ? '#ffd98a' : '#2a2c34'; c.fillRect(x, y, 14, 18); } }, [6, 1]);
+  const termMat = new THREE.MeshLambertMaterial({ map: winTex, emissive: 0xffd98a, emissiveMap: winTex, emissiveIntensity: 0.8 });
+  const term = box(420, 26, 70, termMat, -300, 13, -260); term.castShadow = false; g.add(term);
+  g.add(box(430, 3, 76, M(0x2a2a30), -300, 27, -260));
+  // control tower
+  g.add(cyl(4, 6, 60, M(0x3a3a44), -480, 30, -60, 12)); const top = cyl(12, 9, 10, E(0x2a3a5a, 0x7ab0ff, 0.5), -480, 64, -60, 12); g.add(top);
+  // LAX pylons (ring of glowing columns)
+  const pylonCols = [0x3366ff, 0xff3366, 0x33ffaa, 0xffaa33, 0xaa33ff, 0x33ccff, 0xff6633, 0x66ff33];
+  for (let i = 0; i < 8; i++) { const a = i / 8 * Math.PI * 2; g.add(cyl(2.5, 2.5, 34 - (i % 2) * 8, E(0xffffff, pylonCols[i], 1.4), -60 + Math.cos(a) * 30, 17 - (i % 2) * 4, -280 + Math.sin(a) * 30, 10)); }
+  // Theme Building (flying-saucer with crossing arches)
+  const tb = new THREE.Group(); tb.position.set(-120, 0, -330); g.add(tb);
+  for (const r of [0, Math.PI / 2]) { const arch = mesh(new THREE.TorusGeometry(26, 1.6, 8, 32, Math.PI), M(0xe8e8e8), 0, 0, 0); arch.rotation.y = r; tb.add(arch); }
+  tb.add(cyl(14, 10, 3, E(0xdddddd, 0xffd0a0, 0.3), 0, 22, 0, 24)); tb.add(cyl(2, 3, 22, M(0xcccccc), 0, 11, 0, 10));
+  // LAX sign
+  const signTex = canvasTex(512, 192, (c, w, h) => { c.fillStyle = '#101018'; c.fillRect(0, 0, w, h); c.font = '900 150px Inter, sans-serif'; c.textAlign = 'center'; c.fillStyle = '#ffffff'; c.fillText('LAX', w / 2, 150); });
+  const sign = mesh(new THREE.PlaneGeometry(90, 34), new THREE.MeshBasicMaterial({ map: signTex }), -300, 50, -224); g.add(sign);
+  g.add(box(4, 22, 4, M(0x444), -335, 38, -226)); g.add(box(4, 22, 4, M(0x444), -265, 38, -226));
+  // floodlight poles
+  for (const x of [-40, 40]) { g.add(cyl(0.3, 0.4, 24, M(0x555555), x, 12, -40, 8)); g.add(box(3, 1, 1, E(0xffffff, 0xfff4d0, 2), x, 24, -40)); }
+}
+buildAirport(land, true);
+
+// TARMAC set
+const tarmac = newSet('tarmac');
+tarmac.add(skyDome('#02030c', '#0b1236', '#3a2050'));
+tarmac.add(stars(700, 1300));
+tarmac.add(new THREE.HemisphereLight(0x5060b0, 0x404040, 1.3)); { const fill = new THREE.DirectionalLight(0xc0c8ff, 0.9); fill.position.set(10, 8, 24); tarmac.add(fill); }
+const tarmacKey = new THREE.DirectionalLight(0xfff0d0, 1.6); tarmacKey.position.set(-12, 20, 14); tarmacKey.castShadow = true; tarmacKey.shadow.mapSize.set(2048, 2048);
+Object.assign(tarmacKey.shadow.camera, { left: -20, right: 20, top: 20, bottom: -20, near: 1, far: 80 }); tarmac.add(tarmacKey);
+buildAirport(tarmac, false);
+const plane4 = makePlane(); plane4.scale.setScalar(1.9); plane4.position.set(0, 4.1, -10); plane4.rotation.y = Math.PI / 2 + 0.25; tarmac.add(plane4);
+// airstairs: top near plane door (door on fuselage side facing +z)
+const stairs = new THREE.Group(); tarmac.add(stairs);
+{ const sm = M(0x9a9aa2); const nSteps = 12; const top = 3.1;
+  for (let i = 0; i < nSteps; i++) { const y = top - i * (top / nSteps); const z = -4.9 + i * 0.32; stairs.add(box(1.4, 0.08, 0.34, sm, 0, y, z)); }
+  stairs.add(box(1.6, 0.1, 1.2, sm, 0, top, -5.4));
+  for (const s of [-1, 1]) { const rail = box(0.05, 0.05, 4.4, sm, s * 0.72, 1.6 + 0.9, -3.1); rail.rotation.x = -Math.atan2(top, 3.84); stairs.add(rail); for (let i = 0; i < 5; i++) stairs.add(box(0.04, 0.9, 0.04, sm, s * 0.72, top - i * 0.75 + 0.45 - (top / nSteps) * 0, -4.9 + i * 0.95)); }
+  stairs.position.set(-1.2, 0, 0.4);
+}
+function stairPos(k) { // k 0=top, 1=bottom -> world pos along stairs
+  const top = 3.1; return new THREE.Vector3(-1.2, lerp(top, 0, k), 0.4 + lerp(-5.4, -1.1, k)); }
+// police car
+const car = new THREE.Group(); tarmac.add(car);
+{ car.add(box(4.4, 0.9, 2, M(0xf0f0f0), 0, 0.75, 0)); car.add(box(2.4, 0.8, 1.9, M(0x111111), -0.2, 1.55, 0)); car.add(box(4.4, 0.4, 2.02, M(0x101010), 0, 0.5, 0));
+  for (const [x, z] of [[-1.5, 1.05], [1.5, 1.05], [-1.5, -1.05], [1.5, -1.05]]) { const w = cyl(0.4, 0.4, 0.3, M(0x111111), x, 0.4, z, 12); w.rotation.x = Math.PI / 2; car.add(w); }
+  const lb = box(1.6, 0.25, 0.4, M(0x222), -0.2, 2.05, 0); car.add(lb);
+  car.red = box(0.7, 0.25, 0.38, E(0xff2020, 0xff2020, 2), -0.6, 2.06, 0); car.blue = box(0.7, 0.25, 0.38, E(0x2040ff, 0x2040ff, 2), 0.2, 2.06, 0); car.add(car.red, car.blue);
+  car.lr = new THREE.PointLight(0xff2020, 0, 30, 1.2); car.lr.position.set(-0.6, 2.4, 0); car.lb = new THREE.PointLight(0x2040ff, 0, 30, 1.2); car.lb.position.set(0.2, 2.4, 0); car.add(car.lr, car.lb);
+  car.add(box(1.2, 0.3, 0.02, new THREE.MeshBasicMaterial({ map: canvasTex(256, 64, (c, w, h) => { c.fillStyle = '#fff'; c.fillRect(0, 0, w, h); c.fillStyle = '#123'; c.font = 'bold 40px Inter'; c.textAlign = 'center'; c.fillText('POLICE', w / 2, 46); }) }), 0, 0.85, 1.01));
+  car.position.set(-7.5, 0, 4.5); car.rotation.y = 0.5;
+}
+// baggage cart
+{ const bc = new THREE.Group(); tarmac.add(bc); bc.add(box(2.6, 0.1, 1.4, M(0x777), 0, 0.5, 0)); bc.add(box(2.6, 1.2, 0.05, M(0x6a6a70), 0, 1.1, -0.7)); bc.add(box(2.6, 0.3, 1.4, M(0x4a4a50), 0, 1.6, 0)); for (const x of [-1, 1]) for (const z of [-0.6, 0.6]) { const w = cyl(0.22, 0.22, 0.15, M(0x111), x, 0.22, z, 10); w.rotation.x = Math.PI / 2; bc.add(w); } for (let i = 0; i < 4; i++) bc.add(box(0.6, 0.45, 0.4, M([0x8b0000, 0x224488, 0x333, 0x8b6b2b][i]), -0.9 + i * 0.6, 0.78, (i % 2) * 0.5 - 0.25)); bc.position.set(7.5, 0, 3.5); bc.rotation.y = -0.4; }
+// ambulance light / stretcher-free: paramedic stands with woman
+
+// CABIN set
+const cabin = newSet('cabin');
+cabin.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 1.0));
+const cabinKey = new THREE.DirectionalLight(0xfff6e0, 1.8); cabinKey.position.set(2, 8, 3); cabinKey.castShadow = true; cabinKey.shadow.mapSize.set(2048, 2048);
+Object.assign(cabinKey.shadow.camera, { left: -5, right: 5, top: 10, bottom: -10, near: 1, far: 30 }); cabin.add(cabinKey);
+{
+  const tube = mesh(new THREE.CylinderGeometry(2.2, 2.2, 18, 40, 1, true), new THREE.MeshLambertMaterial({ color: 0xe6e8ee, side: THREE.BackSide }), 0, 1.25, 0); tube.rotation.x = Math.PI / 2; tube.castShadow = false; cabin.add(tube);
+  const carpet = canvasTex(256, 256, (c, w, h) => { c.fillStyle = '#2b3a6a'; c.fillRect(0, 0, w, h); c.fillStyle = '#304480'; for (let i = 0; i < w; i += 16) c.fillRect(i, 0, 2, h); for (let i = 0; i < h; i += 16) c.fillRect(0, i, w, 2); }, [4, 20]);
+  const floor = mesh(new THREE.PlaneGeometry(3.7, 18), new THREE.MeshLambertMaterial({ map: carpet }), 0, 0, 0); floor.rotation.x = -Math.PI / 2; cabin.add(floor);
+  // front bulkhead & cockpit door
+  const bulk = box(4.4, 4.4, 0.1, M(0xd8dae0), 0, 1.25, -8.9); cabin.add(bulk);
+  cabin.add(box(0.9, 2.0, 0.08, M(0x8a8f9a), 0, 1.0, -8.84)); cabin.add(box(0.9, 2.0, 0.08, M(0x8a8f9a), 0, 1.0, 8.9));
+  const back = box(4.4, 4.4, 0.1, M(0xd8dae0), 0, 1.25, 9); cabin.add(back);
+  // ceiling lights
+  for (const x of [-0.9, 0.9]) { const l = box(0.25, 0.04, 17.5, E(0xffffff, 0xfff6e8, 1.2), x, 3.1, 0); l.castShadow = false; cabin.add(l); }
+  // bins
+  for (const s of [-1, 1]) { const b = box(1.1, 0.5, 17.5, M(0xf0f1f4), s * 1.25, 2.25, 0); b.rotation.z = s * 0.3; cabin.add(b); }
+  // windows + seats
+  const seatMat = M(0x2a4a8a), seatMat2 = M(0x1f3a70), arm = M(0x3a3a42);
+  for (let r = 0; r < 14; r++) { const z = -7 + r * 1.05;
+    for (const s of [-1, 1]) { const w = mesh(new THREE.PlaneGeometry(0.32, 0.42), E(0x9ec8ff, 0xcfe4ff, 1.0), s * 2.16, 1.35, z); w.rotation.y = -s * Math.PI / 2; w.castShadow = false; cabin.add(w); const ring = mesh(new THREE.RingGeometry(0.22, 0.27, 16), M(0xffffff), s * 2.15, 1.35, z); ring.rotation.y = -s * Math.PI / 2; ring.castShadow = false; cabin.add(ring);
+      for (const x of [s * 0.72, s * 1.3]) { cabin.add(box(0.52, 0.14, 0.52, seatMat, x, 0.46, z)); cabin.add(box(0.52, 0.72, 0.14, seatMat2, x, 0.88, z + 0.22)); cabin.add(box(0.34, 0.2, 0.1, seatMat, x, 1.32, z + 0.2)); for (let i = 0; i < 4; i++) cabin.add(box(0.46, 0.45, 0.03, M(0x333), x, 0.4, z)); }
+      cabin.add(box(0.07, 0.3, 0.5, arm, s * 0.43, 0.6, z)); cabin.add(box(0.07, 0.3, 0.5, arm, s * 1.0, 0.6, z)); cabin.add(box(0.07, 0.3, 0.5, arm, s * 1.58, 0.6, z));
+      cabin.add(box(0.07, 0.4, 0.52, arm, s * 0.44, 0.33, z)); }
+  }
+  // passengers seated
+  const seatsP = [[-0.72, 1], [1.3, 2], [-1.3, 4], [0.72, 5], [-0.72, 7], [1.3, 8], [-1.3, 10], [0.72, 11]];
+  passengers.forEach((p, i) => { const [x, r] = seatsP[i]; cabin.add(p.root); p.place(x, 0.62, -7 + r * 1.05 - 0.05, Math.PI); p.pose(SIT); p.seat = { x, z: -7 + r * 1.05 - 0.05 }; });
+}
+// COCKPIT set
+const cockpit = newSet('cockpit');
+cockpit.add(new THREE.HemisphereLight(0x8090c0, 0x303030, 1.1)); { const pl = new THREE.PointLight(0xffe0b0, 6, 8, 1.5); pl.position.set(0, 2.2, 0.6); cockpit.add(pl); }
+const ckKey = new THREE.DirectionalLight(0xffe8c0, 1.0); ckKey.position.set(2, 4, 3); cockpit.add(ckKey);
+{
+  const room = mesh(new THREE.BoxGeometry(3.4, 2.6, 4), new THREE.MeshLambertMaterial({ color: 0x3a3c46, side: THREE.BackSide }), 0, 1.3, 0); room.castShadow = false; cockpit.add(room);
+  cockpit.add(box(3.2, 0.9, 0.8, M(0x1a1a22), 0, 1.0, -1.7));
+  const r = seeded(21); for (let i = 0; i < 60; i++) cockpit.add(box(0.05, 0.05, 0.02, E(0xffffff, [0x66ff88, 0xffaa33, 0x66ccff][i % 3], 1.6), -1.4 + r() * 2.8, 0.7 + r() * 0.6, -1.3));
+  cockpit.add(box(0.8, 0.5, 0.02, E(0x002200, 0x33ff66, 0.8), -0.7, 1.25, -1.35)); cockpit.add(box(0.8, 0.5, 0.02, E(0x001133, 0x33aaff, 0.8), 0.7, 1.25, -1.35));
+  for (let i = 0; i < 30; i++) cockpit.add(box(0.06, 0.03, 0.02, E(0xffffff, 0xffcc44, 1.2), -1.2 + (i % 10) * 0.25, 2.3 - Math.floor(i / 10) * 0.12, -0.6 + Math.floor(i / 10) * 0.4));
+  const ws = mesh(new THREE.PlaneGeometry(3.2, 1.0), new THREE.MeshBasicMaterial({ color: 0x0a1030 }), 0, 1.9, -1.95); cockpit.add(ws);
+  cockpit.add(box(1.0, 2.1, 0.06, M(0x8a8f9a), 0, 1.05, 1.97)); // door opening frame
+  cockpit.add(box(1.2, 2.3, 0.04, E(0xffffff, 0xffeedd, 0.9), 0, 1.15, 1.99)); // light spilling from cabin
+  const door = box(0.95, 2.0, 0.05, M(0x9aa0aa), 0.75, 1.0, 1.9); door.rotation.y = -1.3; cockpit.add(door);
+  for (const x of [-0.75, 0.75]) { cockpit.add(box(0.6, 0.12, 0.6, M(0x5a4a3a), x, 0.5, -0.3)); cockpit.add(box(0.6, 0.8, 0.14, M(0x5a4a3a), x, 0.95, 0)); }
+  cockpit.add(pilot.root); pilot.place(0.75, 0.66, -0.35, Math.PI); pilot.pose(SIT);
+  cockpit.add(copilot.root); copilot.place(-0.75, 0.66, -0.35, Math.PI); copilot.pose(SIT);
+}
+
+// ---------- script ----------
+const CAST_COLORS = { TOMMY: '#ff5a5a', WOMAN: '#ff9ad0', MOTHER: '#ffc94a', PILOT: '#8ad0ff', PASSENGER: '#cfcfcf', 'OLD MAN': '#9dff7a', CAPTAIN: '#8ad0ff', TOWER: '#8ad0ff' };
+const CAPS = [
+  [8.0, 10.8, 'CAPTAIN', 'Ladies and gentlemen, we’ve reached cruising altitude. Sit back and relax.'],
+  [12.0, 14.4, 'WOMAN', 'Almost home, little one.'],
+  [15.2, 17.4, 'TOMMY', 'THERE you are.'],
+  [17.6, 21.0, 'TOMMY', 'You really thought you could leave my family and hide on a plane?'],
+  [21.4, 23.8, 'WOMAN', 'Tommy, please. Not here. Think about the baby.'],
+  [24.0, 26.4, 'TOMMY', 'Think about the baby? You should’ve thought about THAT before you ran.'],
+  [27.4, 29.0, 'PASSENGER', 'Somebody STOP him!'],
+  [29.2, 30.8, 'WOMAN', 'MOM—!!'],
+  [33.8, 36.6, 'MOTHER', 'Get. Your hands. Off my daughter.'],
+  [37.0, 38.6, 'MOTHER', 'I’ve got you, sweetheart.'],
+  [38.8, 40.6, 'TOMMY', 'She’s MY wife! This is family business!'],
+  [40.7, 41.8, 'MOTHER', 'Not anymore.'],
+  [42.4, 44.6, 'MOTHER', 'Captain. We are landing at LAX. Now.'],
+  [44.8, 46.8, 'PILOT', 'Ma’am, we’re over the ocean, the nearest—'],
+  [47.0, 49.2, 'MOTHER', 'I OWN this airline. L. A. X. Put it DOWN.'],
+  [49.4, 50.8, 'PILOT', '...Yes ma’am. Diverting to LAX.'],
+  [52.0, 55.6, 'PILOT', 'LAX Tower, Hale One, requesting priority landing. Medical emergency on board.'],
+  [55.8, 57.6, 'TOWER', 'Hale One, cleared to land, runway two-five left.'],
+  [66.0, 68.6, 'TOMMY', 'Get OFF me! Do you know who my FATHER is?!'],
+  [68.8, 71.6, 'MOTHER', 'Yes. And he’s going to hear about tonight from me. Personally.'],
+  [71.8, 73.8, 'MOTHER', 'Enjoy the ride downtown, Tommy.'],
+  [75.6, 79.6, 'OLD MAN', 'HEY! HEY!! What’s all this RACKET?! I’ve been waitin’ at gate forty-two since NINETEEN SEVENTY-FOUR!'],
+  [79.8, 81.4, 'TOMMY', 'Who the hell are YOU?'],
+  [81.6, 85.6, 'OLD MAN', 'Who am I?! WHO AM I?! Sonny, I was flyin’ planes before your daddy figured out which end of the diaper goes UP!'],
+  [85.8, 88.6, 'OLD MAN', 'Hittin’ a lady? A lady with a BABY? In MY airport??'],
+  [89.3, 90.8, 'TOMMY', 'OWW!! My SHIN!'],
+  [91.0, 94.0, 'OLD MAN', 'Now you siddown on that curb and you THINK about what you did.'],
+  [94.4, 97.2, 'OLD MAN', '...Anybody know if the Cinnabon’s still open?'],
+  [97.6, 99.6, 'MOTHER', '...I like him.'],
+];
+const CHYRONS = [
+  [4.8, 10.5, '38,000 FT · SOMEWHERE OVER THE PACIFIC'],
+  [51.0, 59.0, 'DIVERTING · LOS ANGELES INTL'],
+  [59.5, 64.5, 'LAX · RUNWAY 25L'],
+  [65.0, 70.0, 'LAX · REMOTE STAND 7 · 02:14 AM'],
+];
+const talking = (t) => { for (const c of CAPS) if (t >= c[0] && t <= c[1]) return c[2]; return null; };
+const TOTAL = 104;
+
+// UI update
+const el = id => document.getElementById(id);
+function ui(t) {
+  let c = null; for (const x of CAPS) if (t >= x[0] && t <= x[1]) c = x;
+  const cap = el('cap');
+  if (c) { el('who').textContent = c[2]; el('who').style.color = CAST_COLORS[c[2]] || '#fff'; el('txt').textContent = c[3]; cap.style.opacity = clamp(Math.min((t - c[0]) / 0.15, (c[1] - t) / 0.15), 0, 1); } else cap.style.opacity = 0;
+  let ch = null; for (const x of CHYRONS) if (t >= x[0] && t <= x[1]) ch = x;
+  const chy = el('chyron'); if (ch) { chy.textContent = ch[2]; chy.style.opacity = clamp(Math.min((t - ch[0]) / 0.4, (ch[1] - t) / 0.4), 0, 1); } else chy.style.opacity = 0;
+  const title = el('title');
+  if (t < 5) { title.querySelector('.big').textContent = 'THE BILLIONAIRE’S SISTER FIGHTS BACK'; title.querySelector('.small').textContent = 'a 3D fan re-animation · “Emergency Landing”'; title.style.opacity = clamp(Math.min((t - 0.6) / 0.8, (4.6 - t) / 0.6), 0, 1); }
+  else if (t > 100.5) { title.querySelector('.big').textContent = 'THE END'; title.querySelector('.small').textContent = 'Fan-made 3D animation. Stylized original characters. Not affiliated with ReelShort or any creator.'; title.style.opacity = clamp((t - 101) / 0.8, 0, 1); }
+  else title.style.opacity = 0;
+  // flashes (impacts)
+  let f = 0; for (const t0 of [27.75, 28.75, 88.9]) f = Math.max(f, pulse(t, t0, 0.05, 0.2) * 0.75);
+  el('flash').style.opacity = f;
+  // fades
+  let fd = 0;
+  const cuts = [[0, 0.8, 'in'], [10.6, 11.0, 'x'], [30.6, 31.1, 'x'], [41.8, 42.2, 'x'], [50.6, 51.0, 'x'], [58.9, 59.3, 'x'], [64.4, 64.9, 'x'], [100.0, 101.0, 'out']];
+  for (const [a, b, k] of cuts) { if (k === 'in') fd = Math.max(fd, 1 - lin((t - a) / (b - a))); else if (k === 'out') fd = Math.max(fd, lin((t - a) / (b - a))); else if (t >= a && t <= b) fd = Math.max(fd, 1 - Math.abs((t - (a + b) / 2) / ((b - a) / 2))); }
+  if (t > 101) fd = Math.max(fd, 1);
+  el('fade').style.opacity = fd;
+}
+
+function showSet(name, fogColor, fogNear, fogFar) {
+  for (const k in sets) sets[k].visible = (k === name);
+  scene.fog = fogColor != null ? new THREE.Fog(fogColor, fogNear, fogFar) : null;
+}
+function hideAll(...ps) { for (const p of ps) p.root.visible = false; }
+function show(parent, p, vis = true) { if (p.root.parent !== parent) parent.add(p.root); p.root.visible = vis; }
+
+// ----- shot implementations -----
+function shotTitle(t) { // 0-4.8
+  showSet('ext', 0xffd9a0, 200, 900);
+  plane1.position.set(kf(t, [[0, -40], [4.8, 10]], lin), -2, -30); plane1.rotation.set(0, 0, 0.05);
+  clouds1.position.set(0, 0, 0);
+  camSet(new THREE.Vector3(0, 4, 30), new THREE.Vector3(0, 0, -20), 40);
+}
+function shotCruise(t) { // 4.8-11
+  showSet('ext', 0xffd9a0, 150, 700);
+  const u = t - 4.8;
+  plane1.position.set(0, 0, 0); plane1.rotation.set(0.02, 0, 0.03 * Math.sin(u * 0.7));
+  clouds1.position.set(u * 3.5, 0, u * 8);
+  cloudDeck.position.z = (u * 8) % 50;
+  const a = -2.2 + u * 0.22;
+  camSet(new THREE.Vector3(Math.cos(a) * 22, 3 + u * 0.3, Math.sin(a) * 22), new THREE.Vector3(0, 0, 0), 42);
+  plane1.strobe.visible = (Math.floor(u * 6) % 6) === 0;
+}
+// cabin coordinates: woman's seat row 4 at x=0.72 (right side aisle seat), z = -7+4*1.05-0.05 = -2.85
+const WZ = -2.85, WX = 0.72;
+function cabinCommon(t) {
+  showSet('cabin', 0xe6e8ee, 10, 30);
+  show(cabin, woman); show(cabin, tommy); show(cabin, mother);
+  const tk = talking(t);
+  passengers.forEach((p, i) => { const panic = clamp((t - 24.5) / 1.5, 0, 1); const turn = clamp((t - 15) / 1.0, 0, 1) * (i % 2 ? 1 : -1) * 0.8;
+    p.pose(Object.assign({}, SIT, { hy: turn * (1 - panic) + (panic * (p.seat.x > 0 ? 0.9 : -0.9) * (p.seat.z > WZ ? 1 : -1)), tx: -0.3 * panic, lsx: -0.4 - 0.9 * panic * (i % 2), rsx: -0.4 - 0.9 * panic * ((i + 1) % 2), talk: (i === 2 && tk === 'PASSENGER') ? talk(t, true) : 0 }));
+    p.root.position.y = 0.62 + 0.12 * panic * ((i % 3) === 0 ? 1 : 0); });
+}
+function shotCabinA(t) { // 11-21
+  cabinCommon(t); hideAll(mother);
+  // woman seated
+  woman.place(WX, 0.6, WZ, Math.PI);
+  const tk = talking(t);
+  const look = clamp((t - 15.5) / 0.8, 0, 1);
+  woman.pose(Object.assign({}, SIT, { rsx: -0.7, rsz: -0.35, rex: -1.4, lsx: -0.5, lex: -1.0, hx: 0.25 * (1 - look) - 0.1 * look, hy: -1.2 * look, ty: -0.3 * look, talk: talk(t, tk === 'WOMAN') }));
+  // tommy walks down aisle from back (z=+8) to z=-1.6, arriving at 18.5
+  const zT = kf(t, [[13.5, 8.5], [18.6, -1.65]], lin);
+  const walking = t > 13.5 && t < 18.6;
+  const dist = (8.5 - zT);
+  tommy.place(-0.1, tommy.standY + (walking ? Math.abs(Math.sin(dist * 3.2)) * 0.03 : 0), zT, Math.PI);
+  tommy.pose(walking ? tommy.walkPose(dist * 3.2, 0.75, { tx: -0.15, lsx: 0.6 * Math.sin(dist * 3.2), rsx: -0.6 * Math.sin(dist * 3.2), lex: -1.6, rex: -1.6, talk: talk(t, tk === 'TOMMY') }) : { tx: -0.2, hx: 0.3, hy: -0.9, lex: -1.5, rex: -1.5, lsx: 0.2, rsx: 0.2, talk: talk(t, tk === 'TOMMY') });
+  if (t < 14.2) { // close on woman
+    camSet(new THREE.Vector3(-0.5, 1.35, WZ - 1.5), new THREE.Vector3(WX, 1.1, WZ), 36);
+  } else if (t < 18.0) { // looking back down the aisle at tommy approaching
+    camSet(new THREE.Vector3(0.25, 1.35, WZ - 1.8), new THREE.Vector3(-0.1, 1.5, zT), 50);
+  } else { // two shot
+    camSet(new THREE.Vector3(-1.2, 1.85, WZ - 2.4).add(shake(t, 0.004)), new THREE.Vector3(0.3, 1.05, WZ + 0.3), 44);
+  }
+}
+function shotCabinB(t) { // 21-31  assault (stylized)
+  cabinCommon(t); hideAll(mother);
+  const tk = talking(t);
+  // tommy
+  const grab = clamp((t - 21.6) / 0.5, 0, 1);
+  const yank = clamp((t - 23.4) / 0.9, 0, 1);
+  const shove = pulse(t, 25.6, 0.15, 0.5);
+  const strike1 = t >= 27.0 && t < 28.0, strike2 = t >= 28.0 && t < 29.2;
+  let tp = { tx: -0.35 * grab, hx: 0.35, hy: -0.7 * (1 - yank), rsx: -1.3 * grab, rsz: -0.4 * grab, rex: -0.6, lsx: 0.1, lex: -1.5, talk: talk(t, tk === 'TOMMY') };
+  if (yank > 0) tp = { tx: -0.25, hx: 0.3, rsx: -1.0 + 0.9 * yank, rsz: -0.5, rex: -1.0 + 0.5 * yank, lsx: -0.4, lex: -1.2, talk: talk(t, tk === 'TOMMY') };
+  if (shove > 0 || t > 25.6) tp = { tx: -0.4 - 0.2 * shove, hx: 0.35, lsx: -1.6 * shove - 0.3, rsx: -1.6 * shove - 0.3, lex: -0.4, rex: -0.4, talk: talk(t, tk === 'TOMMY') };
+  if (t > 26.4) { // stand over, strikes
+    const sw = (t0) => { const u = t - t0; if (u < 0) return 0; if (u < 0.45) return ss(u / 0.45); if (u < 0.7) return 1 - (u - 0.45) / 0.25 * 1.0; return 0; };
+    const raise = Math.max(sw(27.05), sw(28.05));
+    const swing = (u => u) (0);
+    const hit1 = clamp((t - 27.5) / 0.2, 0, 1) * (t < 27.75 ? 1 : 0), hit2 = clamp((t - 28.5) / 0.2, 0, 1) * (t < 28.75 ? 1 : 0);
+    const down = Math.max(hit1, hit2);
+    tp = { tx: -0.55 - 0.3 * down, hx: 0.5, rsx: 2.2 * raise - 1.6 * down, rsz: -0.3, rex: -1.4 * (1 - down), lsx: -0.6, lex: -1.3, lhx: -0.3, rhx: 0.2, lkx: 0.4, talk: talk(t, tk === 'TOMMY') };
+    if (t > 29.2) tp = { tx: -0.3, hx: 0.3, hy: 0.6, rsx: -0.6, rex: -1.2, lsx: 0.3, lex: -1.3, talk: talk(t, tk === 'TOMMY') };
+  }
+  const tx = kf(t, [[25.4, -0.1], [26.2, 0.05]]), tz = kf(t, [[25.4, -1.65], [26.5, -3.5]]);
+  tommy.place(tx, tommy.standY, tz, Math.PI + 0.2 * yank);
+  tommy.pose(tp);
+  // woman: seated -> pulled up standing in aisle -> shoved -> falls
+  if (t < 23.4) {
+    woman.place(WX, 0.6, WZ, Math.PI);
+    woman.pose(Object.assign({}, SIT, { rsx: -0.7, rsz: -0.35, rex: -1.4, lsx: -1.2 * grab - 0.4, lsz: 0.3 * grab, lex: -0.6, hx: -0.1, hy: -1.1, ty: -0.3, talk: talk(t, tk === 'WOMAN') }));
+  } else if (t < 25.7) {
+    const u = clamp((t - 23.4) / 0.9, 0, 1);
+    const x = lerp(WX, 0.0, u), z = lerp(WZ, WZ - 0.75, u), y = lerp(0.6, woman.standY, u);
+    woman.place(x, y, z, Math.PI + lerp(0, -0.6, u));
+    const stumble = Math.sin(t * 9) * 0.05;
+    woman.pose({ tx: -0.25 + stumble, hx: 0.2, lsx: -1.4, lsz: 0.4, lex: -0.4, rsx: -0.6, rez: 0, rex: -1.5, rsz: -0.3, lhx: lerp(-1.5, -0.1, u), lkx: lerp(1.5, 0.3, u), rhx: lerp(-1.5, 0.15, u), rkx: lerp(1.5, 0.2, u), talk: talk(t, tk === 'WOMAN') });
+  } else {
+    const u = clamp((t - 25.7) / 0.7, 0, 1); // fall
+    const x = lerp(0.0, -0.1, u), z = lerp(WZ - 0.75, WZ - 1.2, u);
+    woman.root.position.set(x, lerp(woman.standY, 0.22, ss(u)), z);
+    woman.root.rotation.set(lerp(0, 0.35, u), Math.PI - 0.6, lerp(0, Math.PI / 2 - 0.2, ss(u)));
+    const curl = clamp((t - 26.3) / 0.6, 0, 1);
+    const flinch = Math.max(pulse(t, 27.6, 0.08, 0.5), pulse(t, 28.6, 0.08, 0.5));
+    woman.pose({ tx: -0.6 * curl - 0.2 * flinch, hx: 0.3 * curl + 0.4 * flinch, lsx: -1.2 - 0.6 * curl, lex: -1.6, lsz: 0.3, rsx: -1.3 - 0.5 * curl, rex: -1.7, rsz: -0.5, lhx: -0.6 - 0.9 * curl, lkx: 1.2 + 0.4 * curl, rhx: -0.4 - 1.0 * curl, rkx: 1.3 + 0.3 * curl, talk: talk(t, tk === 'WOMAN') });
+  }
+  // camera
+  const sh = shake(t, (t > 25.5 ? 0.012 : 0.004) + 0.03 * Math.max(pulse(t, 27.75, 0.02, 0.35), pulse(t, 28.75, 0.02, 0.35)));
+  if (t < 23.4) camSet(new THREE.Vector3(-1.0, 1.95, WZ - 2.0).add(sh), new THREE.Vector3(0.5, 0.95, WZ), 42);
+  else if (t < 26.3) camSet(new THREE.Vector3(1.1, 1.85, WZ - 3.8).add(sh), new THREE.Vector3(0, 1.05, WZ - 1.0), 48);
+  else if (t < 29.2) camSet(new THREE.Vector3(0.15, 0.6, WZ - 3.6).add(sh), new THREE.Vector3(0.0, 0.85, WZ - 1.0), 55);
+  else camSet(new THREE.Vector3(0.3, 0.6, WZ - 3.4).add(sh), new THREE.Vector3(-0.1, 0.4, WZ - 1.2), 44);
+}
+function shotCabinC(t) { // 31-42 mother
+  cabinCommon(t);
+  const tk = talking(t);
+  // woman on the floor (curled), later sits up with mother
+  const sitUp = clamp((t - 36.8) / 1.2, 0, 1);
+  woman.root.position.set(-0.1, lerp(0.22, 0.35, sitUp), WZ - 1.2);
+  woman.root.rotation.set(lerp(0.35, 0, sitUp), Math.PI - 0.6 + 0.9 * sitUp, lerp(Math.PI / 2 - 0.2, 0, sitUp));
+  woman.pose({ tx: -0.8 + 0.5 * sitUp, hx: 0.3, hy: 0.4 * sitUp, lsx: -1.8, lex: -1.6, lsz: 0.3, rsx: -1.8, rex: -1.7, rsz: -0.5, lhx: -1.5, lkx: 1.6, rhx: -1.4, rkx: 1.6, talk: talk(t, tk === 'WOMAN') });
+  // mother: at front (z=-6.3) turns, strides to tommy (z=-3.3) by 35.0, shoves at 35.3, kneels 36.8-38.6, stands, walks to cockpit door (z=-8.4) by 41.5
+  const turn = clamp((t - 31.6) / 0.6, 0, 1);
+  const zM = kf(t, [[32.6, -6.4], [35.0, -3.4], [36.6, -3.4], [37.0, -3.6], [38.7, -3.6], [39.3, -3.8], [41.6, -8.3]], lin);
+  const walking = (t > 32.6 && t < 35.0) || (t > 39.3 && t < 41.6);
+  const faceBack = (t < 39.0);
+  const distM = Math.abs(zM + 6.4) + (t > 39.3 ? 10 : 0);
+  const shoveM = pulse(t, 35.2, 0.12, 0.45);
+  const kneel = clamp((t - 36.6) / 0.5, 0, 1) * (1 - clamp((t - 38.7) / 0.5, 0, 1));
+  mother.place(0.05, mother.standY - 0.45 * kneel + (walking ? Math.abs(Math.sin(distM * 3.4)) * 0.03 : 0), zM, faceBack ? lerp(Math.PI, 0, turn) : Math.PI);
+  let mp;
+  if (walking) mp = mother.walkPose(distM * 3.4, 0.7, { tx: -0.08, hx: 0.05, lex: -0.9, rex: -0.9, talk: talk(t, tk === 'MOTHER') });
+  else if (t < 32.6) mp = { hx: 0.1, hy: 0, lsx: 0.1, rsx: 0.1, lex: -0.4, rex: -0.4, tz: 0 };
+  else if (t < 36.6) mp = { tx: -0.25 * shoveM, hx: 0.25, lsx: -0.5 - 1.3 * shoveM, rsx: -0.5 - 1.3 * shoveM, lex: -0.9 * (1 - shoveM), rex: -0.9 * (1 - shoveM), talk: talk(t, tk === 'MOTHER') };
+  else if (t < 39.3) mp = { tx: -0.6 * kneel, hx: 0.6 * kneel, lsx: -1.0, lex: -1.0, rsx: -1.2, rez: 0, rex: -1.3, rsz: -0.3, lhx: -1.4 * kneel, lkx: 2.2 * kneel, rhx: -0.3 * kneel, rkx: 2.0 * kneel, talk: talk(t, tk === 'MOTHER') };
+  mother.pose(mp);
+  // tommy: standing at z=-2.3 facing -z (toward mother), gets shoved back into seat on left (x=-0.72, row 3 z=-3.9? ) -> fall into seat at z=-1.8 x=-0.72
+  const fly = clamp((t - 35.3) / 0.5, 0, 1);
+  const tPos = kf3(t, [[35.3, [0.05, tommy.standY, -2.4]], [35.8, [-0.7, 0.62, -1.75]]]);
+  tommy.root.position.copy(tPos);
+  tommy.root.rotation.set(0, Math.PI, 0);
+  const sprawl = { tx: 0.35, hx: -0.2, lsx: 0.8, rsx: 1.0, lsz: -0.6, rsz: 0.8, lex: -0.5, rex: -0.7, lhx: -1.2, rhx: -1.5, lkx: 1.3, rkx: 1.6 };
+  const getUp = clamp((t - 38.5) / 1.0, 0, 1);
+  let tp;
+  if (fly <= 0) tp = { tx: -0.2, hx: 0.3, hy: 0.0, lsx: -0.4, rsx: -0.4, lex: -1.4, rex: -1.4, talk: talk(t, tk === 'TOMMY') };
+  else tp = Object.assign({}, sprawl, { tx: 0.35 - 0.5 * getUp, hx: -0.2 + 0.5 * getUp, hy: -0.3 * getUp, lsx: 0.8 - 1.5 * getUp, lex: -0.5 - 0.8 * getUp, rsx: 1.0 - 1.4 * getUp, rsz: 0.8 - 0.6 * getUp, talk: talk(t, tk === 'TOMMY') });
+  tommy.pose(tp);
+  // camera
+  const sh = shake(t, 0.004 + 0.02 * pulse(t, 35.35, 0.02, 0.3));
+  if (t < 33.2) camSet(new THREE.Vector3(-0.3, 1.5, -4.0).add(sh), new THREE.Vector3(0.05, 1.5, -6.4), 36);
+  else if (t < 36.6) camSet(new THREE.Vector3(0.9, 1.55, -5.9).add(sh), new THREE.Vector3(-0.05, 1.2, -2.8), 46);
+  else if (t < 39.3) camSet(new THREE.Vector3(0.6, 1.45, -6.1).add(sh), new THREE.Vector3(-0.1, 0.6, -3.9), 44);
+  else camSet(new THREE.Vector3(0.0, 1.5, -2.0).add(sh), new THREE.Vector3(0.05, 1.3, -8.0), 42);
+}
+function shotCockpit(t) { // 42-51
+  showSet('cockpit', 0x3a3c46, 6, 14);
+  show(cockpit, mother);
+  const tk = talking(t);
+  mother.place(0, mother.standY, 1.75, Math.PI);
+  const point = pulse(t, 47.2, 0.3, 2.0);
+  mother.pose({ tx: -0.1, hx: 0.1, lsx: -0.6 - 0.9 * point, lsz: 0.2, lex: -1.3 * (1 - point), rsx: -0.1, rex: -0.6, rsz: -0.1, talk: talk(t, tk === 'MOTHER') });
+  const pTurn = clamp((t - 42.6) / 0.8, 0, 1);
+  pilot.pose(Object.assign({}, SIT, { hy: -1.7 * pTurn, ty: -0.8 * pTurn, lsx: -1.2, lex: -0.8, rsx: -0.6, rex: -1.2, talk: talk(t, tk === 'PILOT') }));
+  copilot.pose(Object.assign({}, SIT, { hy: 1.0 * pTurn, lsx: -1.0, lex: -1.0, rsx: -1.0, rex: -1.0 }));
+  if (t < 44.7) camSet(new THREE.Vector3(0.5, 1.55, -1.3), new THREE.Vector3(0, 1.45, 1.8), 44);
+  else if (t < 46.9) camSet(new THREE.Vector3(-0.3, 1.55, -1.4), new THREE.Vector3(0.75, 1.4, -0.3), 40);
+  else if (t < 49.4) camSet(new THREE.Vector3(0.2, 1.3, -0.4).add(shake(t, 0.003)), new THREE.Vector3(0, 1.6, 1.8), 40);
+  else camSet(new THREE.Vector3(-0.2, 1.6, -1.45), new THREE.Vector3(0.75, 1.4, -0.3), 42);
+}
+function shotDescent(t) { // 51-59
+  showSet('night', 0x060818, 150, 900);
+  const u = t - 51;
+  plane2.rotation.set(0.05 + 0.12 * ss(u / 3), kf(u, [[0, 0], [5, -0.9]]), kf(u, [[0, 0], [1.5, 0.75], [5, 0.65], [7.5, 0.05]]));
+  plane2.position.set(kf(u, [[0, 0], [8, -45]], lin), kf(u, [[0, 0], [8, -34]], lin), kf(u, [[0, 0], [8, -120]], lin));
+  plane2.strobe.visible = (Math.floor(u * 6) % 6) === 0;
+  const p = plane2.position;
+  const a = 0.5 + u * 0.12;
+  camSet(new THREE.Vector3(p.x + Math.sin(a) * 26, p.y + 6 - u * 0.4, p.z + 28 - u * 1.5), p.clone().add(new THREE.Vector3(0, -2, -6)), 50);
+}
+function shotLanding(t) { // 59-65
+  showSet('land', 0x0a0c20, 200, 1200);
+  const u = t - 59;
+  const z = kf(u, [[0, -210], [6, 170]], lin);
+  const y = kf(u, [[0, 15], [3.2, 3.6], [6, 3.6]]);
+  plane3.position.set(0, y, z); plane3.rotation.set(kf(u, [[0, -0.06], [3.0, -0.08], [3.6, -0.02], [4.2, 0]]), 0, Math.sin(u * 1.5) * 0.02);
+  plane3.gear.visible = true;
+  plane3.strobe.visible = (Math.floor(u * 6) % 6) === 0;
+  camSet(new THREE.Vector3(-45, 7, 20), new THREE.Vector3(0, kf(u, [[0, 12], [3.3, 4], [6, 3]]), kf(u, [[0, -190], [6, 150]], lin)), kf(u, [[0, 26], [3, 40], [6, 50]]));
+}
+function tarmacCommon(t) {
+  showSet('tarmac', 0x0a0c20, 40, 400);
+  show(tarmac, tommy); show(tarmac, mother); show(tarmac, woman); show(tarmac, guard1); show(tarmac, guard2); show(tarmac, medic);
+  const f = Math.floor(t * 4) % 2; car.red.material.emissiveIntensity = f ? 2.5 : 0.2; car.blue.material.emissiveIntensity = f ? 0.2 : 2.5; car.lr.intensity = f ? 60 : 0; car.lb.intensity = f ? 0 : 60;
+  plane4.strobe.visible = (Math.floor(t * 6) % 6) === 0;
+}
+const OM_TIP = new THREE.Vector3();
+function shotTarmacA(t) { // 65-75
+  tarmacCommon(t); show(tarmac, oldman, false); cane.visible = false;
+  const tk = talking(t);
+  // mother at bottom of stairs, woman with medic (blanket-less, hand on belly), tommy + guards descend
+  mother.place(-2.6, mother.standY, 1.9, 0.6);
+  mother.pose({ lsx: -0.6, lex: -1.9, lsz: 0.2, rsx: -0.6, rex: -1.9, rsz: -0.2, hx: 0.05, hy: kf(t, [[67.5, 0], [68.5, -0.3]]), talk: talk(t, tk === 'MOTHER') });
+  woman.place(-3.9, woman.standY, 3.4, 0.5);
+  woman.pose({ tx: -0.1, hx: 0.15, rsx: -0.7, rsz: -0.35, rex: -1.4, lsx: -0.5, lex: -1.0, lkx: 0.2, rkx: 0.2 });
+  medic.place(-4.7, medic.standY, 3.0, 0.7);
+  medic.pose({ rsx: -0.8, rsz: -0.9, rex: -1.2, lsx: -0.3, lex: -0.5, hy: 0.4 });
+  // descend stairs from k=0 at 65.2 to k=1 at 69.5, then walk to (-0.8, 2.6) by 71.5
+  const k = kf(t, [[65.2, 0], [69.5, 1]], lin);
+  let pos, ry;
+  if (t < 69.5) { pos = stairPos(k); ry = Math.PI; }
+  else { const u = clamp((t - 69.5) / 2.0, 0, 1); const a = stairPos(1); pos = new THREE.Vector3(lerp(a.x, -0.8, u), 0, lerp(a.z, 2.6, u)); ry = lerp(Math.PI, Math.PI - 0.9, u); }
+  const moving = t > 65.2 && t < 71.5;
+  const ph = (t - 65.2) * 6.5;
+  const struggle = pulse(t, 66.2, 0.3, 1.2) + pulse(t, 70.2, 0.3, 1.0);
+  tommy.place(pos.x, pos.y + tommy.standY + (moving ? Math.abs(Math.sin(ph)) * 0.03 : 0), pos.z, ry + 0.3 * Math.sin(t * 7) * struggle);
+  tommy.pose(Object.assign(tommy.walkPose(moving ? ph : 0, moving ? 0.55 : 0, {}), { tx: -0.2 - 0.2 * struggle, hx: 0.3, hy: 0.6 * Math.sin(t * 5) * struggle, lsx: 0.9, rsx: 0.9, lsz: -0.5, rsz: 0.5, lex: -1.4, rex: -1.4, talk: talk(t, tk === 'TOMMY') }));
+  for (const [g, side, lead] of [[guard1, -1, -0.45], [guard2, 1, 0.45]]) {
+    let gp; if (t < 69.5) { gp = stairPos(clamp(k + lead * 0.09, 0, 1)); gp.x += side * 0.0; gp.z += 0; } else { const u = clamp((t - 69.5) / 2.0, 0, 1); const a = stairPos(clamp(1 + lead * 0.09, 0, 1)); gp = new THREE.Vector3(lerp(a.x, -0.8 + side * 0.75, u), 0, lerp(a.z + lead * 0.45, 2.6 + lead * 0.2, u)); }
+    g.place(gp.x + (t < 69.5 ? side * 0.45 : 0), gp.y + g.standY + (moving ? Math.abs(Math.sin(ph + side)) * 0.03 : 0), gp.z, ry);
+    g.pose(Object.assign(g.walkPose(moving ? ph + side : 0, moving ? 0.5 : 0, {}), { [side < 0 ? 'rsx' : 'lsx']: -0.9, [side < 0 ? 'rsz' : 'lsz']: side * 0.9, [side < 0 ? 'rex' : 'lex']: -0.6, hx: 0.1 }));
+  }
+  const sh = shake(t, 0.004);
+  if (t < 69.0) camSet(new THREE.Vector3(2.6, 1.8, 5.2).add(sh), new THREE.Vector3(-1.2, 2.1, -2.4), 42);
+  else if (t < 71.7) camSet(new THREE.Vector3(2.4, 1.4, 5.8).add(sh), new THREE.Vector3(-1.5, 1.2, 1.6), 46);
+  else camSet(new THREE.Vector3(-0.4, 1.5, 5.0).add(sh), new THREE.Vector3(-2.4, 1.35, 1.9), 40);
+}
+function shotOldMan(t) { // 75-104
+  tarmacCommon(t); show(tarmac, oldman); cane.visible = true; if (cane.parent !== tarmac) tarmac.add(cane);
+  const tk = talking(t);
+  const turnAll = clamp((t - 75.4) / 0.8, 0, 1);
+  // static-ish cast
+  const smile = clamp((t - 97.4) / 0.6, 0, 1);
+  mother.place(-2.6, mother.standY, 1.9, lerp(0.6 + 0.9 * turnAll, 0.45, smile));
+  mother.pose({ lsx: -0.6, lex: -1.9, lsz: 0.2, rsx: -0.6, rex: -1.9, rsz: -0.2, hx: 0.05 - 0.1 * smile, hy: 0.2 * turnAll, hz: 0.12 * smile, talk: talk(t, tk === 'MOTHER') });
+  woman.place(-3.9, woman.standY, 3.4, 0.5 + 1.0 * turnAll);
+  woman.pose({ tx: -0.1, hx: 0.15, rsx: -0.7, rsz: -0.35, rex: -1.4, lsx: -0.5, lex: -1.0, lkx: 0.2, rkx: 0.2 });
+  medic.place(-4.7, medic.standY, 3.0, 0.7 + 1.0 * turnAll);
+  medic.pose({ rsx: -0.8, rsz: -0.9, rex: -1.2, lsx: -0.3, lex: -0.5, hy: 0.2 });
+  // tommy at (-0.8, 2.6) facing camera-ish; turns to old man (at +x); hop at 88.9; sits on ground at 92
+  const hop = pulse(t, 88.9, 0.12, 0.9);
+  const sit = clamp((t - 91.8) / 1.2, 0, 1);
+  const tRy = Math.PI - 0.9 - 1.1 * turnAll;
+  const hopB = Math.abs(Math.sin(clamp(t - 88.9, 0, 1.2) * 14)) * 0.12 * hop;
+  tommy.place(-0.8 - 0.3 * sit, lerp(tommy.standY + hopB, 0.45, sit), 2.6 + 0.4 * sit, tRy);
+  if (sit <= 0) tommy.pose({ tx: -0.2 - 0.5 * hop, hx: 0.3 + 0.2 * hop, hy: 0, lsx: 0.9 - 1.9 * hop, rsx: 0.9 - 2.0 * hop, lsz: -0.5 + 0.3 * hop, rsz: 0.5 - 0.3 * hop, lex: -1.4, rex: -1.4, rhx: -1.6 * hop, rkx: 2.4 * hop, talk: talk(t, tk === 'TOMMY') });
+  else tommy.pose({ tx: lerp(-0.3, -0.35, sit), hx: 0.3, hy: 0.3, lsx: -0.8, rsx: -0.8, lex: -1.5, rex: -1.5, lhx: -1.3 * sit, rhx: -1.3 * sit, lkx: 1.9 * sit, rkx: 1.9 * sit, lhz: 0.15, rhz: -0.15 });
+  // guards: flank, step back a bit after whack
+  for (const [g, side] of [[guard1, -1], [guard2, 1]]) { g.place(-0.8 + side * 0.78, g.standY, 2.25, tRy); g.pose({ [side < 0 ? 'rsx' : 'lsx']: -0.9 * (1 - sit), [side < 0 ? 'rsz' : 'lsz']: side * 0.9 * (1 - sit), [side < 0 ? 'rex' : 'lex']: -0.6, hx: 0.1, hy: side * -0.5 * turnAll, [side < 0 ? 'lsx' : 'rsx']: -0.3 - 0.8 * clamp((t - 94.6) / 0.8, 0, 1), [side < 0 ? 'lex' : 'rex']: -0.4 - 1.2 * clamp((t - 94.6) / 0.8, 0, 1) }); }
+  // old man path: from (6.5, 0, 3.6) behind cart to (1.4, 0, 2.9) by 79.4; later steps in to (0.6, 0, 2.8) at 87.8 for the whack; retreats slightly 90
+  const ox = kf(t, [[74.4, 6.6], [79.4, 1.5], [87.0, 1.5], [87.9, 0.45], [90.2, 0.45], [91.0, 1.1]], lin);
+  const oz = kf(t, [[74.4, 3.8], [79.4, 2.95], [87.0, 2.95], [87.9, 2.7], [90.2, 2.7], [91.0, 2.9]], lin);
+  const walking = (t > 74.4 && t < 79.4) || (t > 87.0 && t < 87.9) || (t > 90.2 && t < 91.0);
+  const dist = (6.6 - ox) + (t > 87.0 ? 2 : 0);
+  const ph = dist * 7.5; // tiny shuffle steps
+  const facing = -Math.PI / 2 + (t > 79.0 ? 0.25 : 0); // walking toward -x, then turns to face tommy at -x (slightly toward camera)
+  oldman.place(ox, oldman.standY - 0.06 + (walking ? Math.abs(Math.sin(ph)) * 0.02 : 0), oz, facing);
+  // gestures
+  const shakeCane = (t > 81.6 && t < 85.6) || (t > 85.8 && t < 88.4);
+  const whack = (() => { const u = t - 88.3; if (u < 0) return 0; if (u < 0.5) return ss(u / 0.5); if (u < 0.65) return 1 - (u - 0.5) / 0.15 * 1.6; if (u < 1.2) return -0.6 + (u - 0.65) / 0.55 * 0.6; return 0; })();
+  const pointAt = (t > 91.0 && t < 94.2) ? 1 : 0;
+  const lookAround = clamp((t - 94.4) / 0.6, 0, 1) * (1 - clamp((t - 97.4) / 0.6, 0, 1));
+  const op = oldman.walkPose(walking ? ph : 0, walking ? 0.28 : 0, {});
+  const tkOld = tk === 'OLD MAN';
+  const rant = tkOld ? (0.5 + 0.5 * Math.sin(t * 9)) : 0;
+  Object.assign(op, {
+    hy: 0.1 * Math.sin(t * 3) * (tkOld ? 1 : 0.3) + 0.9 * lookAround * Math.sin((t - 94.4) * 2.5), hx: 0.5 + 0.15 * rant, hz: 0.08 * Math.sin(t * 5) * (tkOld ? 1 : 0),
+    lsx: -0.3 - 0.9 * rant * (tkOld ? 1 : 0) - 1.4 * pointAt, lsz: 0.25 + 0.5 * pointAt, lex: -0.6 - 0.3 * rant * (1 - pointAt),
+    rsx: -0.6 + (shakeCane ? (-0.9 + 0.5 * Math.sin(t * 16)) : 0) + whack * 1.4 - (whack < 0 ? 0 : 0), rsz: -0.1 - 0.4 * (shakeCane ? 1 : 0),
+    rex: -0.9 + (shakeCane ? 0.4 * Math.sin(t * 16) - 0.4 : 0) + whack * 0.3,
+    talk: talk(t, tkOld),
+  });
+  if (whack < 0) { op.rsx = -0.6 + whack * 2.2; op.rex = -0.5; }
+  oldman.pose(op);
+  // cane tip target: on the ground near his right foot, lifted when shaking/whacking
+  const rightFoot = new THREE.Vector3(ox + Math.cos(facing) * 0.0 + 0.0, 0, oz).add(new THREE.Vector3(-Math.sin(facing + Math.PI) * 0.35, 0, -Math.cos(facing + Math.PI) * 0.35));
+  const lift = shakeCane ? 0.9 : 0;
+  if (whack > 0.01) { OM_TIP.set(ox - 0.8 - whack * 0.3, 0.9 - whack * 0.75, oz - 0.15); }
+  else if (whack < 0) { OM_TIP.set(-0.35, 0.35, 2.65); }
+  else if (lift > 0) { oldman.arm.R.hand.getWorldPosition(_hp); OM_TIP.set(_hp.x - 0.7, _hp.y + 0.5 + 0.3 * Math.sin(t * 16), _hp.z + 0.1); }
+  else OM_TIP.set(ox - 0.25 - Math.sin(facing) * 0, 0, oz + 0.25);
+  oldman.root.updateMatrixWorld(true);
+  placeCane(OM_TIP);
+  // camera
+  const sh = shake(t, 0.003 + 0.025 * pulse(t, 88.9, 0.02, 0.35));
+  if (t < 77.6) camSet(new THREE.Vector3(-1.5, 1.3, 7.2).add(sh), new THREE.Vector3(kf(t, [[74.4, -1.0], [76.0, ox]]), 1.3, 3.0), 40);
+  else if (t < 79.8) camSet(new THREE.Vector3(3.2, 1.2, 5.3).add(sh), new THREE.Vector3(1.6, 1.25, 2.9), 36);
+  else if (t < 81.6) camSet(new THREE.Vector3(-3.3, 1.45, 4.6).add(sh), new THREE.Vector3(-0.8, 1.45, 2.6), 36);
+  else if (t < 85.7) camSet(new THREE.Vector3(2.0, 1.1, 5.2).add(sh), new THREE.Vector3(1.2, 1.2, 2.9), 34);
+  else if (t < 91.0) camSet(new THREE.Vector3(-0.7, 1.15, 6.0).add(sh), new THREE.Vector3(-0.2, 1.0, 2.7), 42);
+  else if (t < 97.3) camSet(new THREE.Vector3(0.9, 1.3, 6.3).add(sh), new THREE.Vector3(-0.7, 0.7, 2.9), 44);
+  else if (t < 100.2) camSet(new THREE.Vector3(-2.0, 1.45, 3.9).add(sh), new THREE.Vector3(-2.6, 1.42, 1.9), 34);
+  else camSet(new THREE.Vector3(2.5, 2.2, 9.5), new THREE.Vector3(-1.0, 1.0, 2.0), 50);
+}
+
+const SHOTS = [
+  [0, 4.8, shotTitle], [4.8, 11, shotCruise], [11, 21, shotCabinA], [21, 31, shotCabinB], [31, 42, shotCabinC],
+  [42, 51, shotCockpit], [51, 59, shotDescent], [59, 65, shotLanding], [65, 75, shotTarmacA], [75, 104.1, shotOldMan],
+];
+window.TOTAL = TOTAL;
+window.renderFrame = (t) => {
+  for (const [a, b, fn] of SHOTS) if (t >= a && t < b) { fn(t); break; }
+  ui(t);
+  if (q.get('cam')) { const a = q.get('cam').split(',').map(Number); camSet(new THREE.Vector3(a[0], a[1], a[2]), new THREE.Vector3(a[3], a[4], a[5]), a[6] || 50); }
+  renderer.render(scene, camera);
+  return true;
+};
+window.__cam = camera; window.__dbg = { woman, tommy, mother, oldman, sets }; window.ready = true;
+</script>
+</body>
+</html>

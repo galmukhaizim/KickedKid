@@ -1,0 +1,15 @@
+{
+  "name": "emergency-landing-animation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Procedural 3D fan re-animation (Three.js + headless Chromium + ffmpeg)",
+  "scripts": {
+    "serve": "python3 -m http.server 8765 --bind 127.0.0.1",
+    "preview": "node render.js preview 480 270 sheet.png 2 9 16 24 28 34 45 55 63 68 80 88 92 98 && python3 tile.py sheet.png",
+    "render": "node render.js movie 1280 720 24 emergency_landing.mp4"
+  },
+  "dependencies": {
+    "three": "0.170.0",
+    "playwright": "1.56.1"
+  }
+}
